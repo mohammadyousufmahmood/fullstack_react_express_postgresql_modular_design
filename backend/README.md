@@ -1,280 +1,165 @@
-# Backend API — Phase 1: Foundation
+# Phase 2: Identity Schema and Database Migrations
 
-> **Status:** Implemented and verified  
-> **Scope:** API shell, environment validation, PostgreSQL connection pool, readiness check, and centralized error handling  
-> **Out of scope:** Authentication, database schema, migrations, and application records
+## Objective
 
-## Overview
+This phase installs the database tables required for user accounts, roles, permissions, and server-side sessions.
 
-Phase 1 establishes a stable foundation for the backend API. It provides startup configuration validation, one shared PostgreSQL connection pool, a database readiness endpoint, and a consistent error-response format that future modules can reuse.
+The server does **not** run migrations on startup. Use `npm run migrate` whenever the database schema needs to change.
 
-### Goals
+## Design Decisions
 
-- Fail fast at startup when required configuration is missing or invalid.
-- Reuse PostgreSQL connections through a shared `pg.Pool`.
-- Expose a readiness endpoint that checks database connectivity.
-- Return a consistent error envelope for API failures.
-- Keep shared infrastructure separate from business modules.
-- Make the Express app testable without starting the production server.
+### Forward-only migrations
 
-## Architecture and Design Decisions
+SQL migration files are stored in `backend/migrations/`. The runner at `backend/src/db/migrate.js` records each applied filename and its SHA-256 checksum in `schema_migrations`.
 
-### Project structure
+- A second run skips migrations that have already been applied and whose checksums still match.
+- If an applied migration file has changed, the runner stops and instructs you to create a new migration file.
+- A PostgreSQL advisory lock prevents concurrent migration commands from applying the same migration at the same time.
+- Each migration and its checksum record are committed in one transaction.
 
-Business features live under `src/modules/<feature>/`. At this stage, **Health** is the only feature module. Shared configuration, database access, logging, and HTTP error handling remain outside the modules because they are infrastructure used across the application.
+### User accounts
+
+- `users.email` must be stored in lowercase and is unique.
+- Mixed-case email values such as `User@example.com` are rejected by the database.
+- Duplicate email addresses are rejected.
+- `password_hash` cannot be blank.
+- No user accounts are seeded. The migration inserts role and permission definitions only; it creates no default administrator and stores no passwords in SQL.
+
+Application code should normalize email addresses to lowercase before inserting them.
+
+### Role-based access control (RBAC)
+
+The schema includes `roles`, `permissions`, `user_roles`, and `role_permissions`.
+
+- Deleting a user automatically deletes that user's `user_roles` assignments.
+- A role cannot be deleted while it is assigned to users.
+- A permission cannot be deleted while it is granted to a role.
+
+These constraints help prevent accidental removal of authorization data.
+
+#### Seeded roles and permissions
+
+| Role | Permissions |
+|---|---|
+| `admin` | `records.read`, `records.create`, `records.update`, `records.delete`, `users.manage` |
+| `member` | `records.read`, `records.create`, `records.update`, `records.delete` |
+
+The `member` role does not receive `users.manage`. Record ownership restrictions will be implemented with the records feature in a later phase.
+
+### Server-side sessions
+
+The `sessions` table uses the column names expected by `connect-pg-simple`:
+
+- `sid`
+- `sess`
+- `expire`
+
+The table name is `sessions`. In Phase 3, configure the session store with `tableName: 'sessions'`, because the library's default table name is `session`.
+
+The `expire` column uses `timestamp without time zone` to match the library's expiration comparison using `to_timestamp()`.
+
+## Migration Runner
+
+File: `backend/src/db/migrate.js`
+
+The runner:
+
+1. Connects using the existing `DB_*` settings.
+2. Acquires a PostgreSQL advisory lock.
+3. Creates `schema_migrations` if it does not exist.
+4. Checks migration files against stored SHA-256 checksums.
+5. Skips already-applied, unchanged migrations.
+6. Runs each pending SQL file in a transaction and records its checksum.
+7. Releases the advisory lock.
+
+If a migration fails, its transaction is rolled back. Applied migration files must not be edited; add a new migration for subsequent schema changes.
+
+## What `npm run migrate` Does
+
+Run the command from the `backend` directory:
+
+```bash
+npm run migrate
+```
+
+The first run applies pending migrations. A subsequent run makes no schema changes if all applied migration checksums match.
+
+There is no new HTTP route. `GET /health` continues to report database readiness. If the identity tables are missing, the server logs:
 
 ```text
-backend/
-├── .env
-├── .env.example
-├── .gitignore
-├── package.json
-├── src/
-│   ├── app.js
-│   ├── server.js
-│   ├── config/
-│   │   └── env.js
-│   ├── db/
-│   │   └── pool.js
-│   ├── errors/
-│   │   └── AppError.js
-│   ├── lib/
-│   │   └── logger.js
-│   ├── middleware/
-│   │   ├── errorHandler.js
-│   │   └── notFound.js
-│   └── modules/
-│       └── health/
-│           ├── health.controller.js
-│           └── health.routes.js
-└── test/
-    └── phase1.test.js
+Identity schema is not installed. Run npm run migrate.
 ```
 
-### Application and server separation
+The server continues running and does not automatically modify the schema.
 
-- `src/app.js` creates and configures the Express application.
-- `src/server.js` is the only file responsible for listening on a port.
-- Tests can create the app and run it on a temporary port without launching the normal server.
-- The project uses **CommonJS**, matching `"type": "commonjs"` in `package.json`.
+## Database Setup Notes
 
-### PostgreSQL connection pooling
+### PostgreSQL 18 schema permissions
 
-The application uses a shared `pg.Pool`. A pool reuses database connections across requests and avoids creating a new connection for every query. A single shared client could become a bottleneck when requests need database access.
+On the development machine, the `auth_user` role needed permission to create objects in the `public` schema. The database owner granted this privilege:
 
-The readiness check runs `SELECT 1`. It does not use user input, so parameterized queries are not needed for this query. Use parameterized queries when future database queries include values supplied by users or other external input.
-
-### Configuration and secrets
-
-- `src/config/env.js` validates configuration at startup.
-- `backend/.env` contains local environment values and must remain untracked.
-- `backend/.env.example` documents the required configuration using placeholders only.
-- `NODE_ENV` and `CLIENT_ORIGIN` were added to the existing `.env`; existing database settings were left unchanged.
-
-Never commit real passwords, tokens, or other secrets.
-
-### Centralized errors
-
-Expected application errors use `AppError`, such as a request to an unknown route. Unexpected errors are logged with their stack trace and returned to clients as a generic `500 Internal server error`. Sensitive database details and secrets are not exposed in HTTP responses.
-
-All error responses use this envelope:
-
-```json
-{
-  "error": {
-    "code": "NOT_FOUND",
-    "message": "Route not found: GET /missing"
-  }
-}
+```sql
+GRANT CREATE ON SCHEMA public TO auth_user;
 ```
 
-Express 5 automatically forwards rejected promises from asynchronous route handlers to error-handling middleware. Routes therefore do not need a separate async wrapper. The health controller intentionally catches database failures and responds with `503 Service Unavailable`, since that is a known readiness failure rather than an unknown application error.
+This is environment-specific setup, not a migration that the application runs automatically. Apply it only with an appropriately privileged database role and according to your environment's security policy.
 
-### HTTP middleware and security defaults
+### Previous experimental table
 
-The middleware order is intentional:
+The `auth_app` database had an empty `users` table from an earlier experiment, with a `bigint` ID and an integer role column. That empty table was dropped so this migration could create the intended Phase 2 schema.
 
-1. CORS
-2. JSON body parser
-3. Feature routes
-4. 404 handler
-5. Centralized error handler
+Do not drop tables in a populated or shared environment without checking their data and dependencies first.
 
-The error handler is last and uses Express's four-argument signature.
-
-Additional defaults:
-
-- CORS allows only the configured `CLIENT_ORIGIN`.
-- `credentials: true` allows credentialed browser requests, which will be needed for a future session-cookie flow. Credentialed CORS cannot use `Access-Control-Allow-Origin: *`.
-- JSON request bodies are limited to **100 KB**.
-- The `X-Powered-By` header is disabled.
-
-## Health Endpoint
-
-### `GET /health`
-
-This is a **readiness check**: it reports whether the API can reach PostgreSQL. If PostgreSQL is unavailable, the process stays running and the endpoint returns `503`, making the dependency failure visible without immediately terminating the server.
-
-**Success — HTTP `200 OK`**
-
-```json
-{
-  "status": "ok",
-  "database": "up"
-}
-```
-
-**Database unavailable — HTTP `503 Service Unavailable`**
-
-```json
-{
-  "status": "error",
-  "database": "down"
-}
-```
-
-### Request flow
-
-#### `GET /health`
-
-1. `server.js` loads the environment configuration, creates the app, and starts listening.
-2. CORS and the JSON parser run.
-3. `health.routes.js` matches `GET /health`.
-4. `getHealth` executes `pool.query('SELECT 1')`.
-5. The endpoint returns `200` if the query succeeds or `503` if the database connection fails.
-
-#### `GET /missing`
-
-1. No route matches the request.
-2. `notFound` passes an `AppError` with status `404` and code `NOT_FOUND`.
-3. `errorHandler` returns the standard error envelope without exposing a stack trace.
-
-Example response:
-
-```json
-{
-  "error": {
-    "code": "NOT_FOUND",
-    "message": "Route not found: GET /missing"
-  }
-}
-```
-
-#### Malformed JSON
-
-A `POST` request with `Content-Type: application/json` and an invalid body such as `{` is rejected by `express.json` before the route runs. The error handler responds with HTTP `400 Bad Request` and code `INVALID_JSON`.
-
-Example response shape:
-
-```json
-{
-  "error": {
-    "code": "INVALID_JSON",
-    "message": "Invalid JSON request body"
-  }
-}
-```
-
-## Files Added and Updated
+## Files
 
 ### Created
 
-- `backend/.gitignore`
-- `backend/.env.example`
-- `backend/src/config/env.js`
-- `backend/src/lib/logger.js`
-- `backend/src/errors/AppError.js`
-- `backend/src/db/pool.js`
-- `backend/src/middleware/notFound.js`
-- `backend/src/middleware/errorHandler.js`
-- `backend/src/modules/health/health.controller.js`
-- `backend/src/modules/health/health.routes.js`
-- `backend/src/app.js`
-- `backend/src/server.js`
-- `backend/test/phase1.test.js`
+- `backend/migrations/001_identity_and_sessions.sql`
+- `backend/src/db/migrate.js`
+- `backend/test/phase2.test.js`
 
 ### Modified
 
-- `backend/package.json` — `npm test` runs Node.js's built-in test runner.
-- `backend/.env` — added `NODE_ENV` and `CLIENT_ORIGIN`; existing database settings were preserved.
+- `backend/package.json` — added the `npm run migrate` script.
+- `backend/src/server.js` — warns when `users` or `sessions` is missing.
+- `backend/README.md` — added Phase 2 notes.
 
-## Running the Project
+## Commands
 
-Run these commands from the `backend` directory.
-
-### Run the tests
+Run these commands from `backend`:
 
 ```bash
+npm run migrate
 npm test
-```
-
-### Start the development server
-
-```bash
 npm run dev
 ```
 
-### Start without file watching
-
-```bash
-npm start
-```
-
-`npm start` runs the server normally without development file watching.
-
-## Manual API Checks
-
-Start the server with `npm run dev`. In a second PowerShell terminal, use `curl.exe` (rather than `curl`, which may be an alias for `Invoke-WebRequest` in PowerShell).
-
-### Check database readiness
+Check database readiness in another terminal:
 
 ```powershell
 curl.exe http://127.0.0.1:3000/health
 ```
 
-Expected: HTTP `200` and `"database": "up"` while PostgreSQL is available.
-
-### Check the 404 response
-
-```powershell
-curl.exe http://127.0.0.1:3000/missing
-```
-
-Expected: HTTP `404` and `error.code` equal to `NOT_FOUND`.
-
-### Check malformed JSON handling
-
-```powershell
-curl.exe -X POST http://127.0.0.1:3000/health `
-  -H "Content-Type: application/json" `
-  --data "{"
-```
-
-Expected: HTTP `400` and `error.code` equal to `INVALID_JSON`.
-
 ## Verification Results
 
-The following checks were completed for Phase 1:
-
-- All **5 automated tests passed**.
-- A real `SELECT 1` query succeeded against the local `auth_app` PostgreSQL database.
-- A live server on port `3000` returned:
-  - `200` for `/health` when PostgreSQL was available.
-  - `404` for an unknown route.
-  - `400` for malformed JSON.
-- The verification server was stopped after testing, leaving port `3000` available for `npm run dev`.
-
-One test intentionally throws a fake error containing `password=secret detail`. The logger records the original error for testing purposes, while the HTTP response remains the generic `Internal server error`. This confirms that unexpected error details are not returned to the client.
+All seven tests passed, including the Phase 1 checks. `GET /health` returned HTTP 200 with `"database": "up"`, and startup did not warn about a missing identity schema. The development server was stopped afterward, leaving port 3000 free.
 
 ## Acceptance Criteria
 
-- [x] `npm test` passes.
-- [x] `GET /health` returns HTTP `200` and `"database": "up"` while PostgreSQL is running.
-- [x] An unknown path returns HTTP `404` with `error.code: "NOT_FOUND"`.
-- [x] Malformed JSON returns HTTP `400` with `error.code: "INVALID_JSON"`.
-- [x] `backend/.env` is excluded from version control.
-- [x] `backend/.env.example` contains placeholders only and no real database password.
+- [x] `npm run migrate` applies `001_identity_and_sessions.sql` once.
+- [x] A second run applies no additional changes.
+- [x] The `users`, `roles`, `permissions`, `user_roles`, `role_permissions`, `sessions`, and `schema_migrations` tables exist.
+- [x] `admin` has all five seeded permissions.
+- [x] `member` has only the four `records.*` permissions.
+- [x] No user account is seeded.
+- [x] Mixed-case email values are rejected.
+- [x] Duplicate email addresses are rejected.
+- [x] Deleting a permission that is still granted to a role is rejected.
+- [x] Deleting a user removes that user's role assignments.
+- [x] All seven tests pass, including Phase 1 checks.
+- [x] The health endpoint returns HTTP 200 when the database is ready and the identity schema is installed.
+- [x] The server does not run migrations automatically at startup.
 
-## Scope of the Next Phase
+## Phase 2 Outcome
 
-Phase 1 is infrastructure only. It does **not** implement authentication, authorization, roles or permissions, database schema migrations, or application records. Those can be added as separate modules on top of this foundation.
+The database now has a versioned identity schema, seeded RBAC definitions, and the table structure needed for PostgreSQL-backed sessions. Later phases can build authentication, session management, authorization middleware, and record ownership enforcement on this foundation.
