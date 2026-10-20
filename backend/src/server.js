@@ -11,6 +11,14 @@ async function checkDatabase() {
       port: env.db.port,
       database: env.db.name,
     });
+
+    const schema = await pool.query(`
+      SELECT to_regclass('public.users') AS users_table,
+             to_regclass('public.sessions') AS sessions_table
+    `);
+    if (!schema.rows[0].users_table || !schema.rows[0].sessions_table) {
+      logger.warn('Identity schema is not installed. Run npm run migrate.');
+    }
   } catch (err) {
     logger.error('PostgreSQL is not ready. The process will keep running and /health will report database down.', {
       message: err.message,
