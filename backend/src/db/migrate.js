@@ -9,7 +9,9 @@ const MIGRATIONS_DIR = path.resolve(__dirname, '../../migrations');
 const ADVISORY_LOCK_KEY = 714203;
 
 function checksum(sql) {
-  return crypto.createHash('sha256').update(sql).digest('hex');
+  // Editors on Windows may rewrite LF as CRLF. The checksum stays stable either way.
+  const normalized = sql.replace(/\r\n/g, '\n');
+  return crypto.createHash('sha256').update(normalized).digest('hex');
 }
 
 function migrationFiles() {
