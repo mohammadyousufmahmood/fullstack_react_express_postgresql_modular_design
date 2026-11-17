@@ -26,14 +26,17 @@ async function checkDatabase() {
   }
 }
 
-function shutdown(server, signal) {
+function shutdown(server, app, signal) {
   logger.info('Shutting down', { signal });
 
   server.close((closeError) => {
-    pool.end().then(
-      () => process.exit(closeError ? 1 : 0),
-      () => process.exit(1),
-    );
+    Promise.resolve()
+      .then(() => app.locals.sessionStore?.close())
+      .then(() => pool.end())
+      .then(
+        () => process.exit(closeError ? 1 : 0),
+        () => process.exit(1),
+      );
   });
 
   setTimeout(() => {
@@ -52,8 +55,8 @@ function start() {
     checkDatabase();
   });
 
-  process.once('SIGINT', () => shutdown(server, 'SIGINT'));
-  process.once('SIGTERM', () => shutdown(server, 'SIGTERM'));
+  process.once('SIGINT', () => shutdown(server, app, 'SIGINT'));
+  process.once('SIGTERM', () => shutdown(server, app, 'SIGTERM'));
 
   return server;
 }
